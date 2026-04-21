@@ -1397,8 +1397,8 @@ function refreshDashboard() {
   document.getElementById('dashMonth').textContent = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   document.getElementById('topbarDate').textContent = now.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 
-  const mExpenses = DB.expenses.filter(e => { const d = new Date(e.date); return d.getMonth() === month && d.getFullYear() === year; });
-  const mSales = DB.sales.filter(s => { const d = new Date(s.date); return d.getMonth() === month && d.getFullYear() === year; });
+  const mExpenses = DB.expenses.filter(e => { const d = safeDate(e.date); return d.getMonth() === month && d.getFullYear() === year; });
+  const mSales = DB.sales.filter(s => { const d = safeDate(s.date); return d.getMonth() === month && d.getFullYear() === year; });
 
   const totalInc = mSales.reduce((a, s) => a + s.total, 0);
   const totalExp = mExpenses.reduce((a, e) => a + e.amount, 0);
@@ -1413,7 +1413,7 @@ function refreshDashboard() {
   const recent = [];
   DB.expenses.forEach(e => recent.push({ ...e, type: 'expense' }));
   DB.sales.forEach(s => recent.push({ ...s, type: 'income' }));
-  recent.sort((a, b) => new Date(b.date) - new Date(a.date));
+  recent.sort((a, b) => safeDate(b.date) - safeDate(a.date));
   const top = recent.slice(0, 6);
 
   const rl = document.getElementById('recentList');
@@ -1496,7 +1496,7 @@ function saveManualExpense() {
 
   const exp = {
     id: 'r' + Date.now(),
-    date: document.getElementById('expDate').value || todayStr(),
+    date: toDateStr(document.getElementById('expDate').value),
     category: selectedExpCategory,
     description: desc,
     amount: amount,
@@ -1662,7 +1662,7 @@ function addBlankLineItem() {
 
 async function saveReceiptExpenses() {
   if (pendingLineItems.length === 0) { showToast('No items to save'); return; }
-  const date = document.getElementById('receiptDate').value || todayStr();
+  const date = toDateStr(document.getElementById('receiptDate').value);
   const vendor = document.getElementById('receiptVendor').value.trim();
   const notes = document.getElementById('receiptNotes').value.trim();
 
@@ -1769,7 +1769,7 @@ function saveSale() {
 
   const sale = {
     id: 'r' + Date.now(),
-    date: document.getElementById('saleDate').value || todayStr(),
+    date: toDateStr(document.getElementById('saleDate').value),
     buyer: document.getElementById('saleBuyer').value.trim(),
     items,
     total,
@@ -1845,8 +1845,8 @@ function getDateRange(period) {
 
 function refreshReports(period) {
   const { start, end } = getDateRange(period);
-  const expenses = DB.expenses.filter(e => { const d = new Date(e.date); return d >= start && d <= end; });
-  const sales = DB.sales.filter(s => { const d = new Date(s.date); return d >= start && d <= end; });
+  const expenses = DB.expenses.filter(e => { const d = safeDate(e.date); return d >= start && d <= end; });
+  const sales = DB.sales.filter(s => { const d = safeDate(s.date); return d >= start && d <= end; });
 
   const totalInc = sales.reduce((a, s) => a + s.total, 0);
   const totalExp = expenses.reduce((a, e) => a + e.amount, 0);
@@ -1878,8 +1878,8 @@ function drawBarChart(period) {
   }
 
   const data = months.map(m => {
-    const inc = DB.sales.filter(s => { const d = new Date(s.date); return d.getMonth()===m.month && d.getFullYear()===m.year; }).reduce((a,s)=>a+s.total,0);
-    const exp = DB.expenses.filter(e => { const d = new Date(e.date); return d.getMonth()===m.month && d.getFullYear()===m.year; }).reduce((a,e)=>a+e.amount,0);
+    const inc = DB.sales.filter(s => { const d = safeDate(s.date); return d.getMonth()===m.month && d.getFullYear()===m.year; }).reduce((a,s)=>a+s.total,0);
+    const exp = DB.expenses.filter(e => { const d = safeDate(e.date); return d.getMonth()===m.month && d.getFullYear()===m.year; }).reduce((a,e)=>a+e.amount,0);
     return { ...m, inc, exp };
   });
 
@@ -2224,7 +2224,7 @@ function refreshSettings() {
 
   // YTD mileage stats
   const year = new Date().getFullYear();
-  const ytdMileExp = DB.expenses.filter(e => e.mileage && new Date(e.date).getFullYear() === year);
+  const ytdMileExp = DB.expenses.filter(e => e.mileage && safeDate(e.date).getFullYear() === year);
   const ytdMiles = ytdMileExp.reduce((a, e) => a + (e.mileage || 0), 0);
   const ytdValue = ytdMileExp.reduce((a, e) => a + (e.mileage || 0) * (e.mileageRate || rate), 0);
   document.getElementById('ytdMilesSetting').textContent = ytdMiles.toFixed(1) + ' miles';
@@ -2478,8 +2478,7 @@ async function syncToGoogle() {
 // ── Auto-pull on startup if connected ──
 async function initCloudSync() {
   if (!getCloudUrl()) return;
-  setSyncStatus('pulling');
-  await pullFromCloud();
+  return await pullFromCloud();
 }
 
 // ── Legacy autoSync shim (keeps existing save calls working) ──
@@ -2534,7 +2533,7 @@ function updateQuickMileCalc() {
 function saveQuickMileage() {
   const miles = parseFloat(document.getElementById('quickMiles').value) || 0;
   const desc = document.getElementById('quickMileDesc').value.trim();
-  const date = document.getElementById('quickMileDate').value || todayStr();
+  const date = toDateStr(document.getElementById('quickMileDate').value);
   if (miles <= 0) { showToast('Enter miles driven'); return; }
   const rate = getMileageRate();
   const amount = parseFloat((miles * rate).toFixed(2));
@@ -2645,13 +2644,16 @@ function exportToCSV() {
 // ══════════════════════════════════════════════
 //  CLEAR DATA
 // ══════════════════════════════════════════════
-function clearAllData() {
-  if (confirm('This will delete ALL expenses and sales. This cannot be undone. Are you sure?')) {
+async function clearAllData() {
+  if (confirm('This will delete ALL data on this device and in Google Sheets. Cannot be undone. Are you sure?')) {
     if (confirm('Really delete everything?')) {
+      // Clear all localStorage keys
+      ['df_expenses','df_sales','df_vendors','df_categories','df_saleitems'].forEach(k => localStorage.removeItem(k));
+      // Reset in-memory DB
       DB.expenses = [];
-      DB.sales = [];
-      saveDBLocal();
-      refreshDashboard();
+      DB.sales    = [];
+      DB.vendors  = [];
+      refreshAllScreens();
       showToast('All data cleared');
     }
   }
@@ -2674,32 +2676,65 @@ function showToast(msg) {
   setTimeout(() => t.classList.remove('show'), 2500);
 }
 
+// Safely parse any date value — always returns a valid Date object
+function safeDate(val) {
+  if (!val) return new Date(0);
+  if (val instanceof Date) return isNaN(val) ? new Date(0) : val;
+  if (typeof val === 'string' && val.match(/^\d{4}-\d{2}-\d{2}/)) {
+    const p = val.split('-');
+    return new Date(parseInt(p[0]), parseInt(p[1])-1, parseInt(p[2]));
+  }
+  const d = new Date(val);
+  return isNaN(d.getTime()) ? new Date(0) : d;
+}
+
 function todayStr() {
-  return new Date().toISOString().split('T')[0];
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
 }
 
 function fmtDate(str) {
   if (!str) return '';
-  const d = new Date(str + 'T12:00:00');
+  let d;
+  // Handle ISO string like "2025-04-21"
+  if (typeof str === 'string' && str.match(/^\d{4}-\d{2}-\d{2}/)) {
+    const parts = str.split('-');
+    d = new Date(parseInt(parts[0]), parseInt(parts[1])-1, parseInt(parts[2]));
+  } else {
+    d = new Date(str);
+  }
+  if (isNaN(d.getTime())) return String(str).substring(0,10) || '';
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: '2-digit' });
+}
+
+// Ensure a date value is stored as clean YYYY-MM-DD string
+function toDateStr(val) {
+  if (!val) return todayStr();
+  if (typeof val === 'string' && val.match(/^\d{4}-\d{2}-\d{2}/)) return val.substring(0,10);
+  const d = new Date(val);
+  if (isNaN(d.getTime())) return todayStr();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
 }
 
 // ══════════════════════════════════════════════
 //  INIT
 // ══════════════════════════════════════════════
 loadDBLocal();
-refreshDashboard();
 
 // Initialize quick mileage card
 document.getElementById('quickMileDate').value = todayStr();
 document.getElementById('quickMileRateDisplay').textContent = '$' + getMileageRate().toFixed(3);
 
 if (DB.settings.googleConnected && DB.settings.scriptUrl) {
+  // Show loading state, then pull from cloud — cloud data is the truth
   setSyncStatus('pulling');
-  // Pull latest cloud data on every app open — keeps both devices in sync
-  setTimeout(() => initCloudSync(), 600);
+  document.getElementById('recentList').innerHTML = '<div class="empty-state"><div class="empty-icon">☁️</div><div class="empty-text">Loading from cloud…</div></div>';
+  initCloudSync().then(() => {
+    refreshDashboard();
+  });
 } else {
   setSyncStatus('offline');
+  refreshDashboard();
 }
 
 // Service Worker registration for PWA
