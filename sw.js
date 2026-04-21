@@ -1,4 +1,4 @@
-const CACHE_NAME = 'dsf-farm-v1';
+const CACHE_NAME = 'dentonfarm-v1';
 const ASSETS = [
   './',
   './index.html',

@@ -1,6 +1,6 @@
 {
   "name": "Denton South Farm",
-  "short_name": "DSF Farm",
+  "short_name": "DentonFarm",
   "description": "Farm expense and income tracker for Denton South Farm",
   "start_url": "./index.html",
   "display": "standalone",
