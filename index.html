@@ -873,6 +873,18 @@ input:checked + .toggle-slider::before { transform: translateX(20px); }
     </div>
 
     <div class="settings-section">
+      <div class="settings-title">This Device</div>
+      <div class="card" style="margin-bottom:0;border-radius:var(--radius)">
+        <div style="font-size:14px;color:var(--text-muted);margin-bottom:8px">Give this device a name so you can tell which device entered each record in the spreadsheet.</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="text" class="form-input" id="deviceNameInput" placeholder="e.g. My Phone, Office Computer" style="flex:1">
+          <button class="btn btn-primary btn-sm" onclick="saveDeviceName()">Save</button>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:8px" id="deviceNameStatus"></div>
+      </div>
+    </div>
+
+    <div class="settings-section">
       <div class="settings-title">Mileage</div>
       <div class="card" style="margin-bottom:0;border-radius:var(--radius)">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
@@ -2218,6 +2230,11 @@ function refreshSettings() {
   document.getElementById('itemCountDesc').textContent = DB.saleItems.length + ' items';
   document.getElementById('vendorCountDesc').textContent = DB.vendors.length + ' vendors saved';
 
+  // Device name
+  const deviceName = DB.settings.deviceName || '';
+  document.getElementById('deviceNameInput').value = deviceName;
+  document.getElementById('deviceNameStatus').textContent = deviceName ? 'Current: ' + deviceName : 'Not set yet';
+
   // Mileage rate field
   const rate = DB.settings.mileageRate || 0.67;
   document.getElementById('mileageRateInput').value = rate.toFixed(3);
@@ -2308,157 +2325,135 @@ function deleteSaleItem(id) {
 }
 
 // ══════════════════════════════════════════════
-//  CLOUD DATABASE ENGINE (Two-way sync)
-//  Google Sheets is the live database.
-//  Both devices read from & write to it directly.
+//  SYNC ENGINE v5
+//  Rules:
+//  1. Every save immediately POSTs that one record to sheet
+//  2. Sync button GETs all records from sheet -> replaces local
+//  3. Vendors are LOCAL ONLY - never synced (add on each device)
+//  4. Device name is stamped on every record in the sheet
 // ══════════════════════════════════════════════
 
-function getCloudUrl() {
-  return DB.settings.scriptUrl || '';
+function getCloudUrl() { return DB.settings.scriptUrl || ''; }
+function getDeviceName() { return DB.settings.deviceName || 'Unknown Device'; }
+
+// POST one expense to sheet immediately on save
+async function cloudSaveExpense(exp) {
+  const url = getCloudUrl();
+  if (!url) return;
+  const rec = Object.assign({}, exp, { deviceName: getDeviceName() });
+  try {
+    const res = await fetch(url, { method: 'POST',
+      body: JSON.stringify({ action: 'saveExpense', record: rec }) });
+    const data = await res.json();
+    if (data && !data.success) console.warn('saveExpense:', data.error);
+  } catch(e) { console.warn('cloudSaveExpense:', e.message); }
 }
 
-// ── Pull: sync with cloud — never wipes local data if cloud is empty ──
-async function pullFromCloud() {
+// POST one sale to sheet immediately on save
+async function cloudSaveSale(sale) {
   const url = getCloudUrl();
-  if (!url) { showToast('Connect Google Sheets in Settings first'); return false; }
+  if (!url) return;
+  const rec = Object.assign({}, sale, { deviceName: getDeviceName() });
+  try {
+    const res = await fetch(url, { method: 'POST',
+      body: JSON.stringify({ action: 'saveSale', record: rec }) });
+    const data = await res.json();
+    if (data && !data.success) console.warn('saveSale:', data.error);
+  } catch(e) { console.warn('cloudSaveSale:', e.message); }
+}
+
+// POST vendor to sheet (for reference only - not used for sync)
+async function cloudSaveVendor(vendor) {
+  const url = getCloudUrl();
+  if (!url) return;
+  try {
+    await fetch(url, { method: 'POST',
+      body: JSON.stringify({ action: 'saveVendor',
+        record: Object.assign({}, vendor, { deviceName: getDeviceName() }) }) });
+  } catch(e) { console.warn('cloudSaveVendor:', e.message); }
+}
+
+// POST a delete for one record
+async function cloudDelete(type, id) {
+  const url = getCloudUrl();
+  if (!url || !id) return;
+  const actions = { expense: 'deleteExpense', sale: 'deleteSale', vendor: 'deleteVendor' };
+  try {
+    await fetch(url, { method: 'POST',
+      body: JSON.stringify({ action: actions[type] || 'deleteExpense', id: id }) });
+  } catch(e) { console.warn('cloudDelete:', e.message); }
+}
+
+// Upload receipt photo to Drive
+async function uploadReceiptPhoto(base64Data, expenseId) {
+  const url = getCloudUrl();
+  if (!url || !base64Data) return null;
+  try {
+    const res = await fetch(url, { method: 'POST', body: JSON.stringify({
+      action: 'uploadReceipt', imageBase64: base64Data,
+      filename: 'receipt_' + expenseId + '_' + todayStr() + '.jpg',
+      expenseId: expenseId
+    })});
+    const data = await res.json();
+    if (data && data.success && data.url) {
+      showToast('Receipt saved to Drive');
+      return data.url;
+    }
+  } catch(e) { console.warn('uploadReceiptPhoto:', e.message); }
+  return null;
+}
+
+// SYNC BUTTON: GET all records from sheet, replace local DB
+// Vendors are NEVER touched by sync - they stay local
+async function syncToGoogle() {
+  const url = getCloudUrl();
+  if (!url) { openModal('googleModal'); return; }
   setSyncStatus('pulling');
   try {
     const res  = await fetch(url + '?action=read');
     const data = await res.json();
     if (!data.success) throw new Error(data.error || 'Read failed');
-
-    const cloudExpenses = (data.expenses || []).filter(e => e && e.id);
-    const cloudSales    = (data.sales    || []).filter(s => s && s.id);
-    const cloudVendors  = (data.vendors  || []).filter(v => v && v.id);
-
-    // ── Expenses ──
-    if (cloudExpenses.length > 0) {
-      // Cloud has records — use cloud as truth, but keep any local records not yet in cloud
-      const cloudIds = new Set(cloudExpenses.map(e => String(e.id)));
-      const localOnly = DB.expenses.filter(e => e && e.id && !cloudIds.has(String(e.id)));
-      DB.expenses = [...cloudExpenses, ...localOnly];
-      // Push any local-only records up so cloud stays complete
-      for (const exp of localOnly) { cloudSaveExpense(exp); }
-    } else if (DB.expenses.length > 0) {
-      // Cloud is empty but we have local records — push them up, keep local
-      for (const exp of DB.expenses) { cloudSaveExpense(exp); }
+    const expenses = (data.expenses || []).filter(function(e){ return e && e.id; });
+    const sales    = (data.sales    || []).filter(function(s){ return s && s.id; });
+    // Only replace local data if sheet has records - never replace with empty
+    if (expenses.length > 0) DB.expenses = expenses;
+    if (sales.length    > 0) DB.sales    = sales;
+    // Settings from cloud
+    if (data.settings && data.settings.mileageRate) {
+      DB.settings.mileageRate = parseFloat(data.settings.mileageRate) || 0.67;
     }
-    // If both are empty, leave DB.expenses as-is (empty is fine)
-
-    // ── Sales ──
-    if (cloudSales.length > 0) {
-      const cloudIds = new Set(cloudSales.map(s => String(s.id)));
-      const localOnly = DB.sales.filter(s => s && s.id && !cloudIds.has(String(s.id)));
-      DB.sales = [...cloudSales, ...localOnly];
-      for (const sale of localOnly) { cloudSaveSale(sale); }
-    } else if (DB.sales.length > 0) {
-      for (const sale of DB.sales) { cloudSaveSale(sale); }
-    }
-
-    // ── Vendors ──
-    if (cloudVendors.length > 0) {
-      const cloudIds = new Set(cloudVendors.map(v => String(v.id)));
-      const localOnly = DB.vendors.filter(v => v && v.id && !cloudIds.has(String(v.id)));
-      DB.vendors = [...cloudVendors, ...localOnly];
-      for (const v of localOnly) { cloudSaveVendor(v); }
-    } else if (DB.vendors.length > 0) {
-      // Cloud has no vendors yet — push all local vendors up
-      for (const v of DB.vendors) { cloudSaveVendor(v); }
-    }
-
-    // ── Settings ──
-    const cs = data.settings || {};
-    if (cs.mileageRate)       DB.settings.mileageRate = parseFloat(cs.mileageRate) || 0.67;
-    if (cs.expenseCategories) { try { DB.expenseCategories = JSON.parse(cs.expenseCategories); } catch(e){} }
-    if (cs.saleItems)         { try { DB.saleItems = JSON.parse(cs.saleItems); } catch(e){} }
-
+    // NOTE: DB.vendors is never touched here
     saveDBLocal();
     refreshAllScreens();
     setSyncStatus('synced');
-    showToast('Up to date');
-    return true;
+    showToast('Synced - ' + expenses.length + ' expenses, ' + sales.length + ' sales');
   } catch(err) {
     setSyncStatus('error');
-    showToast('Could not reach cloud: ' + err.message);
-    return false;
+    showToast('Sync failed: ' + err.message);
   }
 }
 
-// ── Save a single expense to cloud immediately ──
-async function cloudSaveExpense(exp) {
-  const url = getCloudUrl();
-  if (!url) return;
-  try {
-    await fetch(url, { method:'POST', body: JSON.stringify({ action:'saveExpense', record: exp }) });
-  } catch(e) { syncPending = true; }
+async function initCloudSync() {
+  if (!getCloudUrl()) return;
+  await syncToGoogle();
 }
 
-// ── Save a single sale to cloud immediately ──
-async function cloudSaveSale(sale) {
-  const url = getCloudUrl();
-  if (!url) return;
-  try {
-    await fetch(url, { method:'POST', body: JSON.stringify({ action:'saveSale', record: sale }) });
-  } catch(e) { syncPending = true; }
+// Legacy shim
+function autoSync(record, type) {
+  if (!getCloudUrl()) return;
+  if (type === 'expense') cloudSaveExpense(record);
+  if (type === 'sale')    cloudSaveSale(record);
 }
 
-// ── Delete from cloud ──
-async function cloudDelete(type, id) {
-  const url = getCloudUrl();
-  if (!url || !id) return;
-  const actions = { expense: 'deleteExpense', sale: 'deleteSale', vendor: 'deleteVendor' };
-  const action  = actions[type] || 'deleteExpense';
-  try {
-    await fetch(url, { method:'POST', body: JSON.stringify({ action, id }) });
-  } catch(e) { console.log('cloudDelete failed:', e); }
-}
-
-// ── Upload receipt photo to Google Drive ──
-async function uploadReceiptPhoto(base64Data, expenseId) {
-  const url = getCloudUrl();
-  if (!url || !base64Data) return null;
-  try {
-    const filename = 'receipt_' + expenseId + '_' + todayStr() + '.jpg';
-    const res = await fetch(url, {
-      method: 'POST',
-      body: JSON.stringify({ action:'uploadReceipt', imageBase64: base64Data, filename, expenseId })
-    });
-    const data = await res.json();
-    if (data.success && data.url) {
-      showToast('📷 Receipt saved to Google Drive');
-      return data.url;
-    }
-  } catch(e) {
-    console.log('Drive upload failed:', e);
-  }
-  return null;
-}
-
-// ── Save vendor to cloud ──
-async function cloudSaveVendor(vendor) {
-  const url = getCloudUrl();
-  if (!url) return;
-  try {
-    await fetch(url, { method:'POST', body: JSON.stringify({ action:'saveVendor', record: vendor }) });
-  } catch(e) {}
-}
-
-function catIdFromLabel(label) {
-  const map = { 'Feed':'feed','Supplies':'supplies','Mileage':'mileage',
-    'Materials':'materials','Veterinary':'vet','Equipment':'equipment',
-    'Utilities':'utilities','Other':'other' };
-  return map[label] || (label||'').toLowerCase().replace(/\s+/g,'_') || 'other';
-}
-
-// ── Status indicators ──
 function setSyncStatus(state) {
   const dot   = document.getElementById('syncDot');
   const label = document.getElementById('syncLabel');
-  if (state === 'synced')  { dot.className='sync-dot synced'; label.textContent='Synced'; }
-  if (state === 'pulling') { dot.className='sync-dot'; label.textContent='Pulling…'; }
-  if (state === 'pushing') { dot.className='sync-dot'; label.textContent='Pushing…'; }
-  if (state === 'error')   { dot.className='sync-dot'; label.textContent='Retry'; }
-  if (state === 'offline') { dot.className='sync-dot'; label.textContent='Offline'; }
+  if (!dot || !label) return;
+  if (state === 'synced')  { dot.className = 'sync-dot synced'; label.textContent = 'Synced'; }
+  if (state === 'pulling') { dot.className = 'sync-dot';        label.textContent = 'Syncing...'; }
+  if (state === 'pushing') { dot.className = 'sync-dot';        label.textContent = 'Saving...'; }
+  if (state === 'error')   { dot.className = 'sync-dot';        label.textContent = 'Retry'; }
+  if (state === 'offline') { dot.className = 'sync-dot';        label.textContent = 'Offline'; }
 }
 
 function refreshAllScreens() {
@@ -2466,44 +2461,40 @@ function refreshAllScreens() {
   if (currentScreen === 'expense')  refreshExpenseList();
   if (currentScreen === 'sales')    refreshSalesList();
   if (currentScreen === 'vendors')  refreshVendorList();
-  if (currentScreen === 'reports')  refreshReports(currentPeriod||'month');
+  if (currentScreen === 'reports')  refreshReports(currentPeriod || 'month');
 }
 
-// ── Main sync button ──
-async function syncToGoogle() {
-  if (!getCloudUrl()) { openModal('googleModal'); return; }
-  await pullFromCloud();
+// Device name setting
+function saveDeviceName() {
+  const name = document.getElementById('deviceNameInput').value.trim();
+  if (!name) { showToast('Enter a device name'); return; }
+  DB.settings.deviceName = name;
+  saveDBLocal();
+  document.getElementById('deviceNameStatus').textContent = 'Saved: ' + name;
+  showToast('Device name saved');
 }
 
-// ── Auto-pull on startup if connected ──
-async function initCloudSync() {
-  if (!getCloudUrl()) return;
-  return await pullFromCloud();
+function catIdFromLabel(label) {
+  const map = { 'Feed': 'feed', 'Supplies': 'supplies', 'Mileage': 'mileage',
+    'Materials': 'materials', 'Veterinary': 'vet', 'Equipment': 'equipment',
+    'Utilities': 'utilities', 'Other': 'other' };
+  return map[label] || (label || '').toLowerCase().replace(/\s+/g, '_') || 'other';
 }
 
-// ── Legacy autoSync shim (keeps existing save calls working) ──
-function autoSync(record, type) {
-  if (!getCloudUrl()) return;
-  if (type === 'expense') cloudSaveExpense(record);
-  if (type === 'sale') cloudSaveSale(record);
-}
-
-// ══════════════════════════════════════════════
-//  GOOGLE SETTINGS
-// ══════════════════════════════════════════════
+// Google settings
 function handleGoogleSignIn() { openModal('googleModal'); }
 function handleDriveSetup()   { openModal('googleModal'); }
 
 function saveGoogleSettings() {
   const script = document.getElementById('scriptUrl').value.trim();
   if (!script) { showToast('Paste your Apps Script Web App URL'); return; }
-  DB.settings.scriptUrl = script;
+  DB.settings.scriptUrl       = script;
   DB.settings.googleConnected = true;
   saveDBLocal();
   closeModal('googleModal');
   refreshSettings();
-  showToast('Connected! Pulling data from cloud…');
-  initCloudSync();
+  showToast('Connected! Syncing...');
+  syncToGoogle();
 }
 
 // ══════════════════════════════════════════════
