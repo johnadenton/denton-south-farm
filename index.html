@@ -2403,33 +2403,56 @@ async function uploadReceiptPhoto(base64Data, expenseId) {
   return null;
 }
 
-// SYNC BUTTON: GET all records from sheet, replace local DB
-// Vendors are NEVER touched by sync - they stay local
+// SYNC: GET all records from sheet -> update local DB
+// Vendors are NEVER touched - they stay local only
 async function syncToGoogle() {
   const url = getCloudUrl();
   if (!url) { openModal('googleModal'); return; }
   setSyncStatus('pulling');
   try {
-    const res  = await fetch(url + '?action=read');
-    const data = await res.json();
-    if (!data.success) throw new Error(data.error || 'Read failed');
-    const expenses = (data.expenses || []).filter(function(e){ return e && e.id; });
-    const sales    = (data.sales    || []).filter(function(s){ return s && s.id; });
-    // Only replace local data if sheet has records - never replace with empty
-    if (expenses.length > 0) DB.expenses = expenses;
-    if (sales.length    > 0) DB.sales    = sales;
-    // Settings from cloud
+    const res = await fetch(url + '?action=read');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch(e) { throw new Error('Bad response from script - check deployment'); }
+    if (!data.success) throw new Error(data.error || 'Script returned error');
+
+    const sheetExpenses = (data.expenses || []).filter(function(e){ return e && e.id; });
+    const sheetSales    = (data.sales    || []).filter(function(s){ return s && s.id; });
+
+    if (sheetExpenses.length > 0) {
+      // Sheet has data - use it as truth
+      DB.expenses = sheetExpenses;
+    } else if (DB.expenses.length > 0) {
+      // Sheet empty, we have local data - push local records up to sheet
+      showToast('Uploading local records...');
+      for (var i = 0; i < DB.expenses.length; i++) {
+        await cloudSaveExpense(DB.expenses[i]);
+      }
+    }
+    // else both empty - nothing to do
+
+    if (sheetSales.length > 0) {
+      DB.sales = sheetSales;
+    } else if (DB.sales.length > 0) {
+      for (var j = 0; j < DB.sales.length; j++) {
+        await cloudSaveSale(DB.sales[j]);
+      }
+    }
+
     if (data.settings && data.settings.mileageRate) {
       DB.settings.mileageRate = parseFloat(data.settings.mileageRate) || 0.67;
     }
-    // NOTE: DB.vendors is never touched here
+
+    // DB.vendors is NEVER modified by sync
     saveDBLocal();
     refreshAllScreens();
     setSyncStatus('synced');
-    showToast('Synced - ' + expenses.length + ' expenses, ' + sales.length + ' sales');
+    showToast('Synced - ' + DB.expenses.length + ' expenses, ' + DB.sales.length + ' sales');
   } catch(err) {
     setSyncStatus('error');
     showToast('Sync failed: ' + err.message);
+    console.error('syncToGoogle error:', err);
   }
 }
 
@@ -2636,16 +2659,23 @@ function exportToCSV() {
 //  CLEAR DATA
 // ══════════════════════════════════════════════
 async function clearAllData() {
-  if (confirm('This will delete ALL data on this device and in Google Sheets. Cannot be undone. Are you sure?')) {
-    if (confirm('Really delete everything?')) {
-      // Clear all localStorage keys
-      ['df_expenses','df_sales','df_vendors','df_categories','df_saleitems'].forEach(k => localStorage.removeItem(k));
-      // Reset in-memory DB
+  if (confirm('Delete ALL data on this device? This cannot be undone.')) {
+    if (confirm('Are you sure? All local expenses, sales and vendors will be removed.')) {
+      // Wipe all localStorage keys for this app
+      const keys = Object.keys(localStorage).filter(k => k.startsWith('df_'));
+      keys.forEach(k => localStorage.removeItem(k));
+
+      // Reset in-memory DB (keep settings so URL/device name survive)
       DB.expenses = [];
       DB.sales    = [];
       DB.vendors  = [];
-      refreshAllScreens();
-      showToast('All data cleared');
+
+      // Save cleared state
+      saveDBLocal();
+
+      // Force page reload to clear any in-memory state completely
+      showToast('Data cleared — reloading...');
+      setTimeout(() => window.location.reload(true), 1200);
     }
   }
 }
